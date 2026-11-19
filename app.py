@@ -362,43 +362,55 @@ class Engine:
                 hands.append({"fingers": finger_state(pts), "norm": normalize(pts),
                               "side": chirality(pts)})
                 norms.append(hands[-1]["norm"])
+            # Build a stable side list using mediapipe's handedness index when
+            # available (it is consistent for the same physical hand across frames),
+            # falling back to chirality when the classifier misses a hand.
             if res.multi_handedness:
-                labels = [h.classification[0].label for h in res.multi_handedness]
-            # The classifier mislabels or drops the right hand most of the time;
-            # the landmark-derived side corrects it and covers the missing label.
+                # each entry: {index: 0/1, label: "Left"/"Right"}
+                # multi_handedness is already aligned with multi_hand_landmarks
+                mp_sides = [(h.classification[0].index,
+                             h.classification[0].label) for h in res.multi_handedness]
+                mp_labels = [lbl for _, lbl in mp_sides]
+            else:
+                mp_sides = []
+                mp_labels = []
             side = []
             for i, hand in enumerate(hands):
                 if hand["side"]:
                     name = "Right" if hand["side"] > 0 else "Left"
                 else:
-                    name = labels[i] if i < len(labels) else ""
+                    name = mp_labels[i] if i < len(mp_labels) else ""
                 side.append(name)
-            if len(side) == len(hands):
-                # track each hand by side; fall back to position when the side
-                # flips (happens now and then, mostly on the right hand)
-                used = set()
-                for i, hand in enumerate(hands):
-                    # anchor on the palm centre: the wrist alone re-quantises
-                    # every frame and made the key miss, so the smoothing
-                    # buffer used to restart constantly
-                    anchor = tuple((hand["norm"][0] + hand["norm"][9]) / 2)
-                    prev_side = side[i]
-                    key = (prev_side, anchor)
-                    if key not in hist or key in used:
-                        key = ("pos", anchor)
-                    used.add(key)
-                    buf = hist.setdefault(key, [])
-                    buf.append(hand["fingers"])
-                    del buf[:-4]
-                    if len(buf) >= 2:
-                        # majority vote over recent frames; a noisy frame on the
-                        # weaker-tracked hand no longer drops a held gesture
-                        hand["fingers"] = tuple(sum(f[k] for f in buf) * 2 > len(buf)
-                                                for k in range(5))
-                    hand["key"] = key
-                alive = {hand["key"] for hand in hands}
-                for k in [k for k in hist if k not in alive]:
-                    del hist[k]
+
+            # Stable tracking keys: prefer mediapipe index (0/1), else chirality+quantised pos
+            used = set()
+            for i, hand in enumerate(hands):
+                mp_idx = None
+                if res.multi_handedness and i < len(mp_sides):
+                    mp_idx = mp_sides[i][0]  # 0 or 1, stable for the same hand
+                if mp_idx is not None:
+                    key = ("idx", mp_idx)
+                else:
+                    # quantise anchor to ~1% of palm so it matches frame-to-frame
+                    anchor = tuple(((hand["norm"][0] + hand["norm"][9]) / 2).round(2))
+                    key = (side[i], anchor) if side[i] else ("pos", anchor)
+                if key in used:
+                    # two hands resolved to same key (shouldn't happen); disambiguate by pos
+                    anchor = tuple(((hand["norm"][0] + hand["norm"][9]) / 2).round(2))
+                    key = ("pos", anchor)
+                used.add(key)
+                buf = hist.setdefault(key, [])
+                buf.append(hand["fingers"])
+                del buf[:-4]
+                if len(buf) >= 2:
+                    # majority vote over recent frames; a noisy frame on the
+                    # weaker-tracked hand no longer drops a held gesture
+                    hand["fingers"] = tuple(sum(f[k] for f in buf) * 2 > len(buf)
+                                            for k in range(5))
+                hand["key"] = key
+            alive = {hand["key"] for hand in hands}
+            for k in [k for k in hist if k not in alive]:
+                del hist[k]
             self.last_norms = norms
 
             cfg = self.app.snapshot()
@@ -418,10 +430,10 @@ class Engine:
                 tip = per_hand[i] if i < len(per_hand) else None
                 txt = tip or "не распознан"
                 draw_text(frame, txt, (x, y), (80, 230, 80) if tip else (210, 210, 210))
-                side = {"Left": "левая", "Right": "правая"}.get(
+                hand_side = {"Left": "левая", "Right": "правая"}.get(
                     side[i] if i < len(side) else "", "")
-                if side:
-                    draw_text(frame, side, (x, y + 26), (0, 200, 255), size=15)
+                if hand_side:
+                    draw_text(frame, hand_side, (x, y + 26), (0, 200, 255), size=15)
             name = g["name"] if g else None
             if name == cand and name is not None:
                 cand_n += 1
