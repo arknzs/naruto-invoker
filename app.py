@@ -7,6 +7,7 @@ import ctypes
 import itertools
 import json
 import os
+import random
 import threading
 import time
 import tkinter as tk
@@ -81,8 +82,17 @@ def send_key(name, down):
     user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 
-def run_sequence(keys, interval_ms, hold_ms, stop=None):
-    """keys: 'q w a s d', 'ctrl+c', 'wait:500'. Each token is tapped in order."""
+def jitter(ms, percent):
+    """Pseudo-random delay around ms: spread is ±percent%."""
+    if not percent:
+        return ms
+    spread = ms * percent / 100.0
+    return max(0, ms + random.uniform(-spread, spread))
+
+
+def run_sequence(keys, interval_ms, hold_ms, stop=None, jitter_pct=0, hold_jitter_pct=0):
+    """keys: 'q w a s d', 'ctrl+c', 'wait:500'. Each token is tapped in order.
+    jitter_pct/hold_jitter_pct add pseudo-random spread to each delay/hold time."""
     for token in keys.split():
         if stop and stop.is_set():
             return
@@ -92,10 +102,10 @@ def run_sequence(keys, interval_ms, hold_ms, stop=None):
         combo = token.split("+") if len(token) > 1 and "+" in token.strip("+") else [token]
         for k in combo:
             send_key(k, True)
-        time.sleep(hold_ms / 1000)
+        time.sleep(jitter(hold_ms, hold_jitter_pct) / 1000)
         for k in reversed(combo):
             send_key(k, False)
-        time.sleep(interval_ms / 1000)
+        time.sleep(jitter(interval_ms, jitter_pct) / 1000)
 
 
 def validate_keys(keys):
@@ -426,7 +436,9 @@ class App(tk.Tk):
         def work():
             self.busy[g["name"]] = True
             try:
-                run_sequence(g["keys"], g.get("interval", 100), g.get("hold", 50))
+                run_sequence(g["keys"], g.get("interval", 100), g.get("hold", 50),
+                             jitter_pct=g.get("jitter", 0),
+                             hold_jitter_pct=g.get("hold_jitter", 0))
             except Exception as ex:
                 print("send error:", ex)
             finally:
@@ -444,7 +456,9 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         for i, g in enumerate(self.gestures):
             self.tree.insert("", "end", iid=str(i), text=g["name"] + ("" if g.get("builtin") else " *"),
-                             values=(len(g["hands"]), g.get("keys", ""), g.get("interval", 100)))
+                             values=(len(g["hands"]),
+                                     g.get("keys", "") + (" ~" if g.get("jitter") else ""),
+                                     g.get("interval", 100)))
 
     def selected(self):
         s = self.tree.selection()
@@ -494,13 +508,25 @@ class BindDialog(tk.Toplevel):
         ttk.Spinbox(f, from_=1, to=60000, width=8, textvariable=self.hold).grid(row=3, column=1)
         ttk.Checkbutton(f, text="Повторять, пока жест удерживается", variable=self.repeat).grid(
             row=4, column=0, columnspan=2, sticky="w")
-        ttk.Button(f, text="Сохранить", command=self.ok).grid(row=5, column=0, columnspan=2, pady=6)
+        self.rand_on = tk.BooleanVar(value=g.get("rand_on", False))
+        self.jitter = tk.IntVar(value=g.get("jitter", 15))
+        self.hold_jitter = tk.IntVar(value=g.get("hold_jitter", 0))
+        ttk.Checkbutton(f, text="Псевдослучайный разброс интервалов", variable=self.rand_on).grid(
+            row=5, column=0, columnspan=2, sticky="w")
+        ttk.Label(f, text="Разброс интервала, ±%:").grid(row=6, column=0, sticky="w")
+        ttk.Spinbox(f, from_=0, to=90, width=8, textvariable=self.jitter).grid(row=6, column=1)
+        ttk.Label(f, text="Разброс удержания, ±%:").grid(row=7, column=0, sticky="w")
+        ttk.Spinbox(f, from_=0, to=90, width=8, textvariable=self.hold_jitter).grid(row=7, column=1)
+        ttk.Button(f, text="Сохранить", command=self.ok).grid(row=8, column=0, columnspan=2, pady=6)
 
     def ok(self):
         try:
             validate_keys(self.keys.get())
             self.g.update(keys=self.keys.get().strip(), interval=int(self.interval.get()),
-                          hold=int(self.hold.get()), repeat=self.repeat.get())
+                          hold=int(self.hold.get()), repeat=self.repeat.get(),
+                          rand_on=self.rand_on.get(),
+                          jitter=int(self.jitter.get()) if self.rand_on.get() else 0,
+                          hold_jitter=int(self.hold_jitter.get()) if self.rand_on.get() else 0)
         except Exception as ex:
             messagebox.showerror("Ошибка", str(ex), parent=self)
             return
