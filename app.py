@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 import random
+import sys
 import threading
 import time
 import tkinter as tk
@@ -18,7 +19,13 @@ import mediapipe as mp
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gestures.json")
+# Next to the exe when frozen (the bundle itself is a temp dir), next to the
+# script otherwise.
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG = os.path.join(APP_DIR, "gestures.json")
 
 # --------------------------------------------------------------------------
 # Keyboard emulation (SendInput, scan codes)

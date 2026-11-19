@@ -3,3 +3,6 @@ __pycache__/
 gestures.json
 .venv/
 venv/
+build/
+dist/
+*.spec
