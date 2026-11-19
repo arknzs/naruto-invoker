@@ -167,27 +167,43 @@ def save_gestures(g):
 
 
 def finger_state(pts):
-    """pts: 21x2 pixel array -> tuple of 5 bools (extended)."""
-    w = pts[0]
-    d = lambda i: np.linalg.norm(pts[i] - w)
-    res = [np.linalg.norm(pts[4] - pts[17]) > np.linalg.norm(pts[3] - pts[17]) * 1.05
-           and np.linalg.norm(pts[4] - pts[5]) > np.linalg.norm(pts[3] - pts[5]) * 0.9]
+    """pts: 21x2 pixel array -> tuple of 5 bools (extended).
+
+    A finger is extended when its tip is clearly farther from the wrist than
+    its knuckle. Distances are divided by the palm length, so the rule does not
+    depend on hand size or distance to the camera. The right hand sits at a
+    more oblique angle, and a fixed pixel threshold used to drop it.
+    """
+    palm = np.linalg.norm(pts[9] - pts[0]) or 1.0
+    # thumb: pointing away from the pinky knuckle (open hand ~1.2 palm
+    # lengths, thumb folded into a fist ~0.4)
+    res = [np.linalg.norm(pts[4] - pts[17]) / palm > 0.80]
     for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)):
-        res.append(d(tip) > d(pip) * 1.05)
+        d_tip = np.linalg.norm(pts[tip] - pts[0]) / palm
+        d_pip = np.linalg.norm(pts[pip] - pts[0]) / palm
+        res.append(d_tip > d_pip * 1.22 and d_tip > d_pip + 0.18)
     return tuple(bool(x) for x in res)
 
 
-def normalize(pts):
-    p = pts - pts[0]
-    s = np.linalg.norm(pts[9] - pts[0]) or 1.0
-    return p / s
+def mirrored(norm):
+    """Template seen from the other hand: mirror across the hand's own axis.
+
+    Fingers of a mirrored pose look identical but their offsets do not, and the
+    model is noticeably less accurate on the right hand, so both forms are tried.
+    """
+    m = norm.copy()
+    m[:, 0] *= -1
+    return m
 
 
 def spec_score(spec, hand, thr):
     """Returns score (lower is better) or None when not matching."""
     if spec["type"] == "fingers":
         return 0.25 if tuple(spec["pattern"]) == hand["fingers"] else None
-    d = float(np.mean(np.linalg.norm(hand["norm"] - np.array(spec["pts"]), axis=1)))
+    tmpl = np.array(spec["pts"])
+    d = float(np.mean(np.linalg.norm(hand["norm"] - tmpl, axis=1)))
+    dm = float(np.mean(np.linalg.norm(hand["norm"] - mirrored(tmpl), axis=1)))
+    d = min(d, dm)
     return d if d < thr else None
 
 
@@ -291,6 +307,7 @@ class Engine:
                                 min_tracking_confidence=0.3)
         draw = mp.solutions.drawing_utils
         cand, cand_n, fired, idle, last_t = None, 0, None, 0, time.time()
+        hist = {}                 # hand_side -> recent finger states (smoothing)
         while not stop.is_set():
             ok, frame = cap.read()
             if not ok:
@@ -307,6 +324,29 @@ class Engine:
                 norms.append(hands[-1]["norm"])
             if res.multi_handedness:
                 labels = [h.classification[0].label for h in res.multi_handedness]
+            if len(labels) == len(hands):
+                # track each hand by side; fall back to position when the side
+                # flips (happens now and then, mostly on the right hand)
+                used = set()
+                for i, hand in enumerate(hands):
+                    wrist = hand["norm"][0].round(2)
+                    prev_side = labels[i]
+                    key = (prev_side, tuple(wrist))
+                    if key not in hist or key in used:
+                        key = ("pos", tuple(wrist))
+                    used.add(key)
+                    buf = hist.setdefault(key, [])
+                    buf.append(hand["fingers"])
+                    del buf[:-4]
+                    if len(buf) >= 2:
+                        # majority vote over recent frames; a noisy frame on the
+                        # weaker-tracked hand no longer drops a held gesture
+                        hand["fingers"] = tuple(sum(f[k] for f in buf) * 2 > len(buf)
+                                                for k in range(5))
+                    hand["key"] = key
+                alive = {hand["key"] for hand in hands}
+                for k in [k for k in hist if k not in alive]:
+                    del hist[k]
             self.last_norms = norms
 
             cfg = self.app.snapshot()
