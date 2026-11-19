@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+gestures.json
+.venv/
+venv/
