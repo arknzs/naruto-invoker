@@ -365,37 +365,56 @@ class Engine:
             # Build a stable side list using mediapipe's handedness index when
             # available (it is consistent for the same physical hand across frames),
             # falling back to chirality when the classifier misses a hand.
+            # NOTE: MediaPipe often gives BOTH hands index=0 and label="Left"
+            # when two hands are present, so we can't trust mp_index alone.
             if res.multi_handedness:
-                # each entry: {index: 0/1, label: "Left"/"Right"}
-                # multi_handedness is already aligned with multi_hand_landmarks
                 mp_sides = [(h.classification[0].index,
                              h.classification[0].label) for h in res.multi_handedness]
                 mp_labels = [lbl for _, lbl in mp_sides]
             else:
                 mp_sides = []
                 mp_labels = []
+
+            # Detect mp_index collision (both hands same index) -> cannot trust mp
+            mp_collision = False
+            if len(mp_sides) >= 2:
+                indices = [idx for idx, _ in mp_sides]
+                if len(set(indices)) == 1:
+                    mp_collision = True
+
             side = []
+            wrist_x = []
             for i, hand in enumerate(hands):
+                wrist_x.append(hand["norm"][0][0])  # normalised x of wrist
+                # Prefer chirality (works for single hand), mp_label as tie-breaker
                 if hand["side"]:
                     name = "Right" if hand["side"] > 0 else "Left"
+                elif not mp_collision and i < len(mp_labels):
+                    name = mp_labels[i]
                 else:
-                    name = mp_labels[i] if i < len(mp_labels) else ""
+                    name = ""
                 side.append(name)
 
-            # Stable tracking keys: prefer mediapipe index (0/1), else chirality+quantised pos
+            # If chirality failed (both same) and mp collided, disambiguate by wrist x
+            # In mirrored view: left hand is on the RIGHT side of image (larger x)
+            if len(side) == 2 and side[0] == side[1] and side[0] in ("Left", "Right"):
+                if wrist_x[0] < wrist_x[1]:
+                    side[0], side[1] = "Left", "Right"
+                else:
+                    side[0], side[1] = "Right", "Left"
+
+            # Stable tracking keys: prefer chirality+quantised pos (survives mp flips),
+            # mp_index only when reliable (no collision)
             used = set()
             for i, hand in enumerate(hands):
-                mp_idx = None
-                if res.multi_handedness and i < len(mp_sides):
-                    mp_idx = mp_sides[i][0]  # 0 or 1, stable for the same hand
-                if mp_idx is not None:
+                if not mp_collision and res.multi_handedness and i < len(mp_sides):
+                    mp_idx = mp_sides[i][0]
                     key = ("idx", mp_idx)
                 else:
                     # quantise anchor to ~1% of palm so it matches frame-to-frame
                     anchor = tuple(((hand["norm"][0] + hand["norm"][9]) / 2).round(2))
                     key = (side[i], anchor) if side[i] else ("pos", anchor)
                 if key in used:
-                    # two hands resolved to same key (shouldn't happen); disambiguate by pos
                     anchor = tuple(((hand["norm"][0] + hand["norm"][9]) / 2).round(2))
                     key = ("pos", anchor)
                 used.add(key)
