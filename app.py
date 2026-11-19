@@ -16,7 +16,7 @@ from tkinter import ttk, messagebox
 import cv2
 import mediapipe as mp
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gestures.json")
 
@@ -217,6 +217,29 @@ def recognize(gestures, hands, thr):
     return best
 
 
+def recognize_single(gestures, hand, thr):
+    """Best one-hand gesture name for a single hand (used for per-hand labels)."""
+    g = recognize([x for x in gestures if len(x["hands"]) == 1], [hand], thr)
+    return g["name"] if g else None
+
+
+def load_ui_font(size):
+    for name in ("arialbd.ttf", "seguisb.ttf", "tahomabd.ttf", "arial.ttf"):
+        try:
+            return ImageFont.truetype(os.path.join(r"C:\Windows\Fonts", name), size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def draw_text(frame, text, pos, color, size=20):
+    """Draws text with a real TTF font (cv2 Hershey fonts cannot render Cyrillic)."""
+    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    ImageDraw.Draw(img).text(pos, text, font=load_ui_font(size), fill=color,
+                             stroke_width=3, stroke_fill=(0, 0, 0))
+    frame[:] = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+
+
 # --------------------------------------------------------------------------
 # Camera / recognition worker
 # --------------------------------------------------------------------------
@@ -263,9 +286,10 @@ class Engine:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
         mph = mp.solutions.hands
-        draw, styles = mp.solutions.drawing_utils, mp.solutions.drawing_styles
-        hands_model = mph.Hands(max_num_hands=2, min_detection_confidence=0.6,
-                                min_tracking_confidence=0.5)
+        hands_model = mph.Hands(max_num_hands=2, model_complexity=0,
+                                min_detection_confidence=0.5,
+                                min_tracking_confidence=0.3)
+        draw = mp.solutions.drawing_utils
         cand, cand_n, fired, idle, last_t = None, 0, None, 0, time.time()
         while not stop.is_set():
             ok, frame = cap.read()
@@ -275,18 +299,37 @@ class Engine:
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
             res = hands_model.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            hands = []
-            if res.multi_hand_landmarks:
-                for lm in res.multi_hand_landmarks:
-                    pts = np.array([[p.x * w, p.y * h] for p in lm.landmark])
-                    hands.append({"fingers": finger_state(pts), "norm": normalize(pts)})
-                    if self.app.show_points.get():
-                        draw.draw_landmarks(frame, lm, mph.HAND_CONNECTIONS,
-                                            styles.get_default_hand_landmarks_style(),
-                                            styles.get_default_hand_connections_style())
-            self.last_norms = [x["norm"] for x in hands]
+            hands, norms, labels = [], [], []
+            landmarks = res.multi_hand_landmarks or []
+            for lm in landmarks:
+                pts = np.array([[p.x * w, p.y * h] for p in lm.landmark])
+                hands.append({"fingers": finger_state(pts), "norm": normalize(pts)})
+                norms.append(hands[-1]["norm"])
+            if res.multi_handedness:
+                labels = [h.classification[0].label for h in res.multi_handedness]
+            self.last_norms = norms
 
-            g = recognize(self.app.gestures, hands, self.app.thr.get()) if hands else None
+            cfg = self.app.snapshot()
+            if hands:
+                g = recognize(cfg["gestures"], hands, cfg["thr"])
+                per_hand = [recognize_single(cfg["gestures"], h, cfg["thr"]) for h in hands]
+            else:
+                g, per_hand = None, []
+
+            if cfg["points"]:
+                for lm in landmarks:
+                    draw.draw_landmarks(frame, lm, mph.HAND_CONNECTIONS)
+            for i, lm in enumerate(landmarks):
+                wrist = lm.landmark[0]
+                x = min(max(int(wrist.x * w) - 40, 4), w - 140)
+                y = int(min(max(wrist.y * h - 40, 40), h - 24))
+                tip = per_hand[i] if i < len(per_hand) else None
+                txt = tip or "не распознан"
+                draw_text(frame, txt, (x, y), (80, 230, 80) if tip else (210, 210, 210))
+                side = {"Left": "левая", "Right": "правая"}.get(
+                    labels[i] if i < len(labels) else "", "")
+                if side:
+                    draw_text(frame, side, (x, y + 26), (0, 200, 255), size=15)
             name = g["name"] if g else None
             if name == cand and name is not None:
                 cand_n += 1
@@ -298,7 +341,7 @@ class Engine:
                     fired = None
             else:
                 idle = 0
-            self.current = name if cand_n >= self.app.hold_frames.get() else None
+            self.current = name if cand_n >= cfg["hold_frames"] else None
             if self.current and (fired != self.current or
                                  (g.get("repeat") and not self.app.is_busy(g))):
                 fired = self.current
@@ -307,9 +350,10 @@ class Engine:
             now = time.time()
             self.fps = 0.9 * self.fps + 0.1 / max(now - last_t, 1e-3)
             last_t = now
-            label = (self.current or (f"... {name}" if name else "нет жеста"))
-            cv2.putText(frame, label, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                        (0, 255, 0) if self.current else (0, 200, 255), 2)
+            label = (self.current or (f"{name}..." if name else "жест не распознан"))
+            draw_text(frame, label, (10, 10), (80, 255, 80) if self.current else (0, 210, 255),
+                      size=26)
+            draw_text(frame, f"рук: {len(hands)}", (w - 90, 12), (200, 200, 200), size=16)
             with self.lock:
                 self.frame = frame
         cap.release()
@@ -393,6 +437,16 @@ class App(tk.Tk):
                   text="Клавиши: через пробел, по порядку: q w a s d. Комбинации: ctrl+c. "
                        "Пауза: wait:500 (мс). Спец: space enter tab esc up down left right f1..f12.").pack(
             fill="x", pady=4)
+
+    # ---- settings snapshot for the worker thread
+    def snapshot(self):
+        """Copy of Tk settings; Tk variables must only be read from the main thread."""
+        try:
+            return {"gestures": self.gestures, "thr": self.thr.get(),
+                    "points": self.show_points.get(),
+                    "hold_frames": self.hold_frames.get()}
+        except (tk.TclError, RuntimeError):
+            return {"gestures": self.gestures, "thr": 0.3, "points": True, "hold_frames": 5}
 
     # ---- camera
     def refresh_cameras(self):
