@@ -185,6 +185,13 @@ def finger_state(pts):
     return tuple(bool(x) for x in res)
 
 
+def normalize(pts):
+    """Landmarks relative to the wrist, scaled by palm length (hand-shape template)."""
+    p = pts - pts[0]
+    s = np.linalg.norm(pts[9] - pts[0]) or 1.0
+    return p / s
+
+
 def mirrored(norm):
     """Template seen from the other hand: mirror across the hand's own axis.
 
