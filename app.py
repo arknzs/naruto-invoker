@@ -192,6 +192,28 @@ def finger_state(pts):
     return tuple(bool(x) for x in res)
 
 
+def chirality(pts):
+    """+1 for a right hand, -1 for a left one, from the landmark image itself.
+
+    The handedness classifier struggles on the right hand and drops it, so this
+    is a fallback: in the mirrored image (y down) the thumb sits on the +x side
+    of the pinky for the right hand and on the -x side for the left one.
+    Landmarks can arrive rotated sideways, so the palm normal is taken from the
+    wrist->middle-knuckle axis. Returns 0 when the pose is too degenerate.
+    """
+    # Fingers point away from the wrist; the pinky-to-thumb order around the
+    # palm is what separates the hands. Take the forward axis from the wrist
+    # and the pinky->index axis across the palm, so rotation does not matter.
+    fwd = pts[9] - pts[0]
+    across = pts[5] - pts[17]
+    if np.linalg.norm(fwd) < 1e-6:
+        return 0
+    s = fwd[0] * across[1] - fwd[1] * across[0]
+    if abs(s) < 1e-6:
+        return 0
+    return 1 if s < 0 else -1
+
+
 def normalize(pts):
     """Landmarks relative to the wrist, scaled by palm length (hand-shape template)."""
     p = pts - pts[0]
@@ -316,9 +338,12 @@ class Engine:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
         mph = mp.solutions.hands
+        # The model is much less confident on the right hand: with 0.5/0.3 it
+        # only picked it up for single frames, which is too few for the hold
+        # counter and the smoothing buffer below to ever settle.
         hands_model = mph.Hands(max_num_hands=2, model_complexity=0,
-                                min_detection_confidence=0.5,
-                                min_tracking_confidence=0.3)
+                                min_detection_confidence=0.3,
+                                min_tracking_confidence=0.2)
         draw = mp.solutions.drawing_utils
         cand, cand_n, fired, idle, last_t = None, 0, None, 0, time.time()
         hist = {}                 # hand_side -> recent finger states (smoothing)
@@ -334,20 +359,33 @@ class Engine:
             landmarks = res.multi_hand_landmarks or []
             for lm in landmarks:
                 pts = np.array([[p.x * w, p.y * h] for p in lm.landmark])
-                hands.append({"fingers": finger_state(pts), "norm": normalize(pts)})
+                hands.append({"fingers": finger_state(pts), "norm": normalize(pts),
+                              "side": chirality(pts)})
                 norms.append(hands[-1]["norm"])
             if res.multi_handedness:
                 labels = [h.classification[0].label for h in res.multi_handedness]
-            if len(labels) == len(hands):
+            # The classifier mislabels or drops the right hand most of the time;
+            # the landmark-derived side corrects it and covers the missing label.
+            side = []
+            for i, hand in enumerate(hands):
+                if hand["side"]:
+                    name = "Right" if hand["side"] > 0 else "Left"
+                else:
+                    name = labels[i] if i < len(labels) else ""
+                side.append(name)
+            if len(side) == len(hands):
                 # track each hand by side; fall back to position when the side
                 # flips (happens now and then, mostly on the right hand)
                 used = set()
                 for i, hand in enumerate(hands):
-                    wrist = hand["norm"][0].round(2)
-                    prev_side = labels[i]
-                    key = (prev_side, tuple(wrist))
+                    # anchor on the palm centre: the wrist alone re-quantises
+                    # every frame and made the key miss, so the smoothing
+                    # buffer used to restart constantly
+                    anchor = tuple((hand["norm"][0] + hand["norm"][9]) / 2)
+                    prev_side = side[i]
+                    key = (prev_side, anchor)
                     if key not in hist or key in used:
-                        key = ("pos", tuple(wrist))
+                        key = ("pos", anchor)
                     used.add(key)
                     buf = hist.setdefault(key, [])
                     buf.append(hand["fingers"])
@@ -381,7 +419,7 @@ class Engine:
                 txt = tip or "не распознан"
                 draw_text(frame, txt, (x, y), (80, 230, 80) if tip else (210, 210, 210))
                 side = {"Left": "левая", "Right": "правая"}.get(
-                    labels[i] if i < len(labels) else "", "")
+                    side[i] if i < len(side) else "", "")
                 if side:
                     draw_text(frame, side, (x, y + 26), (0, 200, 255), size=15)
             name = g["name"] if g else None
@@ -683,6 +721,8 @@ class RecordDialog(tk.Toplevel):
         if len(self.samples) < 5:
             self.info.config(text=f"Не вижу {self.n.get()} рук(и). Повторите.")
             return
+        # engine.last_norms is already normalize()-d; matching compares against
+        # that space, so a scale-less template is all that is needed here
         cnt = self.n.get()
         if cnt == 1:
             tmpl = [np.mean([s[0] for s in self.samples], axis=0)]
@@ -699,6 +739,8 @@ class RecordDialog(tk.Toplevel):
                 acc[0].append(a)
                 acc[1].append(b)
             tmpl = [np.mean(x, axis=0) for x in acc]
+        # mirrored() is minimised against during matching, so storing either
+        # chirality is enough - no need to record the hand separately
         self.captured = [{"type": "template", "pts": t.tolist()} for t in tmpl]
         self.info.config(text="Записано ✓. Нажмите «Сохранить».")
 
